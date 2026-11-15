@@ -14,15 +14,6 @@
 // Handlers running) and not be woken up again until the PING packet
 // returns.
 
-// TODO (maybe): add a mechanism for Handlers to going into
-// half-closed-local mode (rw.(io.Closer) test?) but not exit their
-// handler, and continue to be able to read from the
-// Request.Body. This would be a somewhat semantic change from HTTP/1
-// (or at least what we expose in net/http), so I'd probably want to
-// add it there too. For now, this package says that returning from
-// the Handler ServeHTTP function means you're both done reading and
-// done writing, without a way to stop just one or the other.
-
 package http2
 
 import (
@@ -90,6 +81,9 @@ var (
 
 // Server is an HTTP/2 server.
 type Server struct {
+	// EnableExtendedConnectProtocol enables RFC 8441 on this server without
+	// changing the process-wide GODEBUG setting.
+	EnableExtendedConnectProtocol bool
 	// MaxHandlers limits the number of http.Handler ServeHTTP goroutines
 	// which may run at a time over all connections.
 	// Negative or zero no limit.
@@ -935,7 +929,7 @@ func (sc *serverConn) serve(conf http2Config) {
 		{SettingHeaderTableSize, conf.MaxDecoderHeaderTableSize},
 		{SettingInitialWindowSize, uint32(sc.initialStreamRecvWindowSize)},
 	}
-	if !disableExtendedConnectProtocol {
+	if sc.srv.EnableExtendedConnectProtocol || !disableExtendedConnectProtocol {
 		settings = append(settings, Setting{SettingEnableConnectProtocol, 1})
 	}
 	sc.writeFrame(FrameWriteRequest{
@@ -1029,11 +1023,14 @@ func (sc *serverConn) serve(conf http2Config) {
 					return
 				case gracefulShutdownMsg:
 					sc.startGracefulShutdownInternal()
-				case handlerDoneMsg:
-					sc.handlerDone()
 				default:
 					panic("unknown timer")
 				}
+			case handlerDoneMessage:
+				if st := v.stream; st.state == stateHalfClosedLocal && !st.resetQueued {
+					sc.resetStream(streamError(st.id, ErrCodeNo))
+				}
+				sc.handlerDone()
 			case *startPushRequest:
 				sc.startPush(v)
 			case func(*serverConn):
@@ -1093,6 +1090,8 @@ func (sc *serverConn) handlePingTimer(lastFrameReadTime time.Time) {
 
 type serverMessage int
 
+type handlerDoneMessage struct{ stream *stream }
+
 // Message values sent to serveMsgCh.
 var (
 	settingsTimerMsg    = new(serverMessage)
@@ -1100,7 +1099,6 @@ var (
 	readIdleTimerMsg    = new(serverMessage)
 	shutdownTimerMsg    = new(serverMessage)
 	gracefulShutdownMsg = new(serverMessage)
-	handlerDoneMsg      = new(serverMessage)
 )
 
 func (sc *serverConn) onSettingsTimer() { sc.sendServeMsg(settingsTimerMsg) }
@@ -1367,22 +1365,14 @@ func (sc *serverConn) wroteFrame(res frameWriteResult) {
 		}
 		switch st.state {
 		case stateOpen:
-			// Here we would go to stateHalfClosedLocal in
-			// theory, but since our handler is done and
-			// the net/http package provides no mechanism
-			// for closing a ResponseWriter while still
-			// reading data (see possible TODO at top of
-			// this file), we go into closed state here
-			// anyway, after telling the peer we're
-			// hanging up on them. We'll transition to
-			// stateClosed after the RST_STREAM frame is
-			// written.
 			st.state = stateHalfClosedLocal
 			// Section 8.1: a server MAY request that the client abort
 			// transmission of a request without error by sending a
 			// RST_STREAM with an error code of NO_ERROR after sending
 			// a complete response.
-			sc.resetStream(streamError(st.id, ErrCodeNo))
+			if st.ctx.Err() != nil {
+				sc.resetStream(streamError(st.id, ErrCodeNo))
+			}
 		case stateHalfClosedRemote:
 			sc.closeStream(st, errHandlerComplete)
 		}
@@ -1865,13 +1855,7 @@ func (sc *serverConn) processData(f *DataFrame) error {
 	// "If a DATA frame is received whose stream is not in "open"
 	// or "half closed (local)" state, the recipient MUST respond
 	// with a stream error (Section 5.4.2) of type STREAM_CLOSED."
-	if st == nil || state != stateOpen || st.gotTrailerHeader || st.resetQueued {
-		// This includes sending a RST_STREAM if the stream is
-		// in stateHalfClosedLocal (which currently means that
-		// the http.Handler returned, so it's done reading &
-		// done writing). Try to stop the client from sending
-		// more DATA.
-
+	if st == nil || (state != stateOpen && state != stateHalfClosedLocal) || st.gotTrailerHeader || st.resetQueued {
 		// But still enforce their connection-level flow control,
 		// and return any flow control bytes since we're not going
 		// to consume them.
@@ -1971,7 +1955,11 @@ func (st *stream) endStream() {
 		st.body.closeWithErrorAndCode(io.EOF, st.copyTrailersToHandlerRequest)
 		st.body.CloseWithError(io.EOF)
 	}
-	st.state = stateHalfClosedRemote
+	if st.state == stateHalfClosedLocal {
+		sc.closeStream(st, errHandlerComplete)
+	} else {
+		st.state = stateHalfClosedRemote
+	}
 }
 
 // copyTrailersToHandlerRequest is run in the Handler's goroutine in
@@ -2237,7 +2225,7 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 	}
 
 	// extended connect is disabled, so we should not see :protocol
-	if disableExtendedConnectProtocol && rp.Protocol != "" {
+	if !sc.srv.EnableExtendedConnectProtocol && disableExtendedConnectProtocol && rp.Protocol != "" {
 		return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
 	}
 
@@ -2397,7 +2385,7 @@ func (sc *serverConn) handlerDone() {
 
 // Run on its own goroutine.
 func (sc *serverConn) runHandler(rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) {
-	defer sc.sendServeMsg(handlerDoneMsg)
+	defer sc.sendServeMsg(handlerDoneMessage{stream: rw.rws.stream})
 	didPanic := true
 	defer func() {
 		rw.rws.stream.cancelCtx()
@@ -2605,6 +2593,8 @@ type responseWriterState struct {
 	wroteHeader   bool        // WriteHeader called (explicitly or implicitly). Not necessarily sent to user yet.
 	sentHeader    bool        // have we sent the header frame?
 	handlerDone   bool        // handler has finished
+	writeClosed   bool        // response ended while request body may still be read
+	endStreamSent bool        // END_STREAM was successfully written
 
 	sentContentLen int64 // non-zero if handler set a Content-Length header
 	wroteBytes     int64
@@ -2658,11 +2648,18 @@ func (rws *responseWriterState) declareTrailer(k string) {
 // writeChunk is also responsible (on the first chunk) for sending the
 // HEADER response.
 func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
+	if rws.endStreamSent {
+		if len(p) != 0 {
+			return 0, io.ErrClosedPipe
+		}
+		return 0, nil
+	}
+	finished := rws.handlerDone || rws.writeClosed
 	if !rws.wroteHeader {
 		rws.writeHeader(200)
 	}
 
-	if rws.handlerDone {
+	if finished {
 		rws.promoteUndeclaredTrailers()
 	}
 
@@ -2713,7 +2710,7 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			}
 		}
 
-		endStream := (rws.handlerDone && !rws.hasTrailers() && len(p) == 0) || isHeadResp
+		endStream := (finished && !rws.hasTrailers() && len(p) == 0) || isHeadResp
 		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
 			streamID:      rws.stream.id,
 			httpResCode:   rws.status,
@@ -2727,34 +2724,37 @@ func (rws *responseWriterState) writeChunk(p []byte) (n int, err error) {
 			return 0, err
 		}
 		if endStream {
+			rws.endStreamSent = true
 			return 0, nil
 		}
 	}
 	if isHeadResp {
 		return len(p), nil
 	}
-	if len(p) == 0 && !rws.handlerDone {
+	if len(p) == 0 && !finished {
 		return 0, nil
 	}
 
 	// only send trailers if they have actually been defined by the
 	// server handler.
 	hasNonemptyTrailers := rws.hasNonemptyTrailers()
-	endStream := rws.handlerDone && !hasNonemptyTrailers
+	endStream := finished && !hasNonemptyTrailers
 	if len(p) > 0 || endStream {
 		// only send a 0 byte DATA frame if we're ending the stream.
 		if err := rws.conn.writeDataFromHandler(rws.stream, p, endStream); err != nil {
 			return 0, err
 		}
+		rws.endStreamSent = endStream
 	}
 
-	if rws.handlerDone && hasNonemptyTrailers {
+	if finished && hasNonemptyTrailers {
 		err = rws.conn.writeHeaders(rws.stream, &writeResHeaders{
 			streamID:  rws.stream.id,
 			h:         rws.handlerHeader,
 			trailers:  rws.trailers,
 			endStream: true,
 		})
+		rws.endStreamSent = err == nil
 		return len(p), err
 	}
 	return len(p), nil
@@ -2899,6 +2899,21 @@ func (w *responseWriter) FlushError() error {
 	return err
 }
 
+// CloseWrite flushes the response and sends END_STREAM without ending the
+// handler or canceling the request body. The caller must serialize it with
+// Write and Flush, as with other ResponseWriter operations.
+func (w *responseWriter) CloseWrite() error {
+	rws := w.rws
+	if rws == nil {
+		return io.ErrClosedPipe
+	}
+	if rws.writeClosed && rws.endStreamSent {
+		return nil
+	}
+	rws.writeClosed = true
+	return w.FlushError()
+}
+
 func (w *responseWriter) CloseNotify() <-chan bool {
 	rws := w.rws
 	if rws == nil {
@@ -3023,6 +3038,9 @@ func (w *responseWriter) write(lenData int, dataB []byte, dataS string) (n int, 
 	rws := w.rws
 	if rws == nil {
 		panic("Write called after Handler finished")
+	}
+	if rws.writeClosed {
+		return 0, io.ErrClosedPipe
 	}
 	if !rws.wroteHeader {
 		w.WriteHeader(200)
